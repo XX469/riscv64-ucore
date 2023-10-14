@@ -65,17 +65,18 @@ default_init(void) {
 }
 
 static void
-default_init_memmap(struct Page *base, size_t n) {
-    assert(n > 0);
+default_init_memmap(struct Page *base, size_t n) { //init a free page  parameter: addr_base, page_number
+    assert(n > 0); //check whether page number>0
     struct Page *p = base;
-    for (; p != base + n; p ++) {
-        assert(PageReserved(p));
-        p->flags = p->property = 0;
-        set_page_ref(p, 0);
+    for (; p != base + n; p ++) { //init each page
+        assert(PageReserved(p)); // check whether this page is valid
+        p->flags = p->property = 0; 
+        set_page_ref(p, 0); //page->ref=0; because now p is free and no reference
     }
-    base->property = n;
-    SetPageProperty(base);
-    nr_free += n;
+    base->property = n;  //base page set totalnum of block
+    SetPageProperty(base);  //set base->flags->property bit to 1
+    nr_free += n; //update num free blocks
+    // insert this page to free_list
     if (list_empty(&free_list)) {
         list_add(&free_list, &(base->page_link));
     } else {
@@ -93,41 +94,41 @@ default_init_memmap(struct Page *base, size_t n) {
 }
 
 static struct Page *
-default_alloc_pages(size_t n) {
-    assert(n > 0);
-    if (n > nr_free) {
+default_alloc_pages(size_t n) { //find a first free block parameter:block size
+    assert(n > 0);//check whether block size>0
+    if (n > nr_free) { //can't find a free block
         return NULL;
     }
     struct Page *page = NULL;
     list_entry_t *le = &free_list;
     while ((le = list_next(le)) != &free_list) {
         struct Page *p = le2page(le, page_link);
-        if (p->property >= n) {
+        if (p->property >= n) { // find the first free block by scanning free_list
             page = p;
             break;
         }
     }
-    if (page != NULL) {
-        list_entry_t* prev = list_prev(&(page->page_link));
-        list_del(&(page->page_link));
-        if (page->property > n) {
-            struct Page *p = page + n;
-            p->property = page->property - n;
-            SetPageProperty(p);
-            list_add(prev, &(p->page_link));
+    if (page != NULL) { // really find a free block,update free_list
+        list_entry_t* prev = list_prev(&(page->page_link)); //last page
+        list_del(&(page->page_link));  // remove this page 
+        if (page->property > n) {  //if this page have space remained,update it and insert back
+            struct Page *p = page + n; //new page start from block n+1
+            p->property = page->property - n; //update property
+            SetPageProperty(p); //set new page property to 1
+            list_add(prev, &(p->page_link)); //add it to free_list
         }
-        nr_free -= n;
-        ClearPageProperty(page);
+        nr_free -= n; //re-caluclate nr_free
+        ClearPageProperty(page); //page->property ->0
     }
     return page;
 }
 
 static void
-default_free_pages(struct Page *base, size_t n) {
+default_free_pages(struct Page *base, size_t n) {//relink the pages into  free list & merge small free blocks into big free blocks
     assert(n > 0);
     struct Page *p = base;
     for (; p != base + n; p ++) {
-        assert(!PageReserved(p) && !PageProperty(p));
+        assert(!PageReserved(p) && !PageProperty(p));//this page have invalid block,error
         p->flags = 0;
         set_page_ref(p, 0);
     }
@@ -135,29 +136,29 @@ default_free_pages(struct Page *base, size_t n) {
     SetPageProperty(base);
     nr_free += n;
 
-    if (list_empty(&free_list)) {
+    if (list_empty(&free_list)) { //insert this page to free_list
         list_add(&free_list, &(base->page_link));
     } else {
         list_entry_t* le = &free_list;
-        while ((le = list_next(le)) != &free_list) {
+        while ((le = list_next(le)) != &free_list) {//find a correct position
             struct Page* page = le2page(le, page_link);
             if (base < page) {
                 list_add_before(le, &(base->page_link));
                 break;
-            } else if (list_next(le) == &free_list) {
+            } else if (list_next(le) == &free_list) {//insert to tail
                 list_add(le, &(base->page_link));
             }
         }
     }
-
+    // try to merge last and next blocks if they are not the beginning of this free_list and connected
     list_entry_t* le = list_prev(&(base->page_link));
     if (le != &free_list) {
         p = le2page(le, page_link);
-        if (p + p->property == base) {
+        if (p + p->property == base) { //their addresses are connected together,merge them
             p->property += base->property;
             ClearPageProperty(base);
             list_del(&(base->page_link));
-            base = p;
+            base = p; //base = new big page
         }
     }
 
