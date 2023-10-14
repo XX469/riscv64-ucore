@@ -1,167 +1,120 @@
 #include <pmm.h>
 #include <list.h>
 #include <string.h>
-#include <best_fit_pmm.h>
+#include <buddy_pmm.h>
 #include <stdio.h>
 
-/* In the first fit algorithm, the allocator keeps a list of free blocks (known as the free list) and,
-   on receiving a request for memory, scans along the list for the first block that is large enough to
-   satisfy the request. If the chosen block is significantly larger than that requested, then it is 
-   usually split, and the remainder added to the list as another free block.
-   Please see Page 196~198, Section 8.2 of Yan Wei Min's chinese book "Data Structure -- C programming language"
-*/
 
-// you should rewrite functions: default_init,default_init_memmap,default_alloc_pages, default_free_pages.
-/*
- * Details of FFMA
- * (1) Prepare: In order to implement the First-Fit Mem Alloc (FFMA), we should manage the free mem block use some list.
- *              The struct free_area_t is used for the management of free mem blocks. At first you should
- *              be familiar to the struct list in list.h. struct list is a simple doubly linked list implementation.
- *              You should know howto USE: list_init, list_add(list_add_after), list_add_before, list_del, list_next, list_prev
- *              Another tricky method is to transform a general list struct to a special struct (such as struct page):
- *              you can find some MACRO: le2page (in memlayout.h), (in future labs: le2vma (in vmm.h), le2proc (in proc.h),etc.)
- * (2) default_init: you can reuse the  demo default_init fun to init the free_list and set nr_free to 0.
- *              free_list is used to record the free mem blocks. nr_free is the total number for free mem blocks.
- * (3) default_init_memmap:  CALL GRAPH: kern_init --> pmm_init-->page_init-->init_memmap--> pmm_manager->init_memmap
- *              This fun is used to init a free block (with parameter: addr_base, page_number).
- *              First you should init each page (in memlayout.h) in this free block, include:
- *                  p->flags should be set bit PG_property (means this page is valid. In pmm_init fun (in pmm.c),
- *                  the bit PG_reserved is setted in p->flags)
- *                  if this page  is free and is not the first page of free block, p->property should be set to 0.
- *                  if this page  is free and is the first page of free block, p->property should be set to total num of block.
- *                  p->ref should be 0, because now p is free and no reference.
- *                  We can use p->page_link to link this page to free_list, (such as: list_add_before(&free_list, &(p->page_link)); )
- *              Finally, we should sum the number of free mem block: nr_free+=n
- * (4) default_alloc_pages: search find a first free block (block size >=n) in free list and reszie the free block, return the addr
- *              of malloced block.
- *              (4.1) So you should search freelist like this:
- *                       list_entry_t le = &free_list;
- *                       while((le=list_next(le)) != &free_list) {
- *                       ....
- *                 (4.1.1) In while loop, get the struct page and check the p->property (record the num of free block) >=n?
- *                       struct Page *p = le2page(le, page_link);
- *                       if(p->property >= n){ ...
- *                 (4.1.2) If we find this p, then it' means we find a free block(block size >=n), and the first n pages can be malloced.
- *                     Some flag bits of this page should be setted: PG_reserved =1, PG_property =0
- *                     unlink the pages from free_list
- *                     (4.1.2.1) If (p->property >n), we should re-caluclate number of the the rest of this free block,
- *                           (such as: le2page(le,page_link))->property = p->property - n;)
- *                 (4.1.3)  re-caluclate nr_free (number of the the rest of all free block)
- *                 (4.1.4)  return p
- *               (4.2) If we can not find a free block (block size >=n), then return NULL
- * (5) default_free_pages: relink the pages into  free list, maybe merge small free blocks into big free blocks.
- *               (5.1) according the base addr of withdrawed blocks, search free list, find the correct position
- *                     (from low to high addr), and insert the pages. (may use list_next, le2page, list_add_before)
- *               (5.2) reset the fields of pages, such as p->ref, p->flags (PageProperty)
- *               (5.3) try to merge low addr or high addr blocks. Notice: should change some pages's p->property correctly.
- */
+struct buddy {
+    size_t size; //sum pages
+    size_t nodenum; //node nums
+    size_t longest[40000]; //complete_binary_tree index and their pagenumbers
+    size_t start_page_index[40000]; //first page index that belong to this node
+};
+
+struct buddy buddy_tree; //use a complete binary tree to manage pages
+struct Page* pages_start; //allocate first page
+
 free_area_t free_area;
 
 #define free_list (free_area.free_list)
 #define nr_free (free_area.nr_free)
-
+// define tree nodes
+#define LEFT_CHILD(index) ((index) * 2 + 1)
+#define RIGHT_CHILD(index) ((index) * 2 + 2)
+#define PARENT(index) ( ((index) + 1) / 2 - 1)
+// define some useful function
+#define IS_POWER_OF_2(x) (!((x)&((x)-1)))  //check if x is 2^n
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+static size_t CLOSEST_POWER_OF_2_BELOW(size_t n)
+{
+    size_t res = 1;
+    if (!IS_POWER_OF_2(n)) {
+        while (n) {
+            n = n >> 1;
+            res = res << 1;
+        }
+        return res>>1; 
+    }
+    else {
+        return n;
+    }
+}
+static size_t CLOSEST_POWER_OF_2_ABOVE(size_t n)
+{
+    size_t res = 1;
+    if (!IS_POWER_OF_2(n)) {
+        while (n) {
+            n = n >> 1;
+            res = res << 1;
+        }
+        return res; 
+    }
+    else {
+        return n;
+    }
+}
+static size_t find_alloc_index(size_t n) //find a node whose size==n
+{
+    if(buddy_tree.longest[0] < n) // too large
+    {
+        return -1;
+    }
+    int index=0;
+    size_t curr_size;
+    //DFS find index
+    for(curr_size=buddy_tree.size;curr_size!=n;curr_size /= 2)
+    {
+        if(buddy_tree.longest[LEFT_CHILD(index)] >= n)
+        {
+            //struct Page* pl = pages_start + buddy_tree.start_page_index[LEFT_CHILD(index)];
+            index = LEFT_CHILD(index);
+        }
+        else
+        {
+            index = RIGHT_CHILD(index);
+        }
+    }
+    //update longest array
+    buddy_tree.longest[index]=0;
+    int i=index;
+    while(i)
+    {
+        i=PARENT(i);
+        buddy_tree.longest[i]=MAX(buddy_tree.longest[LEFT_CHILD(i)],buddy_tree.longest[RIGHT_CHILD(i)]);
+    }
+    return index;
+}
+static void print_tree_info(size_t n) //print node0~n and other info about buddy tree
+{
+    cprintf("tree size:%d\n node num:%d\n",buddy_tree.size,buddy_tree.nodenum);
+    for(int i=0;i<n;i++)
+    {
+        cprintf("index:%d curr_size:%d page_index:%d\n",i,buddy_tree.longest[i],buddy_tree.start_page_index[i]);
+    }
+}
+//===================================================================================
 static void
-best_fit_init(void) {
+buddy_init(void) {
     list_init(&free_list);
     nr_free = 0;
 }
 
 static void
-best_fit_init_memmap(struct Page *base, size_t n) {
-    assert(n > 0);
+buddy_init_memmap(struct Page *base, size_t n) //init pages and buddy tree
+{
+    assert(n>0); //check whether page number>0
+    size_t page_num = CLOSEST_POWER_OF_2_BELOW(n); //n = 32256 -> page num = 16384(2^14)
     struct Page *p = base;
-    for (; p != base + n; p ++) {
-        assert(PageReserved(p));
-
-        /*LAB2 EXERCISE 2: YOUR CODE*/ 
-        // 清空当前页框的标志和属性信息，并将页框的引用计数设置为0
-        p->flags=0;
-        p->property=0;
-        set_page_ref(p,0);
-        
+    for (; p != base + page_num; p ++) { //init each page
+        //assert(PageReserved(p)); // check whether this page is valid
+        p->flags = p->property = 0; 
+        set_page_ref(p, 0); //page->ref=0; because now p is free and no reference
     }
-    base->property = n;
-    SetPageProperty(base);
-    nr_free += n;
-    if (list_empty(&free_list)) {
-        list_add(&free_list, &(base->page_link));
-    } else {
-        list_entry_t* le = &free_list;
-        while ((le = list_next(le)) != &free_list) {
-            struct Page* page = le2page(le, page_link);
-             /*LAB2 EXERCISE 2: YOUR CODE*/ 
-            // 编写代码
-            // 1、当base < page时，找到第一个大于base的页，将base插入到它前面，并退出循环
-            if(base<page)
-            {
-                list_add_before(le,&(base->page_link));
-                break;
-            }
-            // 2、当list_next(le) == &free_list时，若已经到达链表结尾，将base插入到链表尾部
-            if(list_next(le) == &free_list)
-            {
-                list_add_after(le,&(base->page_link));
-                break;
-            }
-        }
-    }
-}
-
-static struct Page *
-best_fit_alloc_pages(size_t n) {
-    assert(n > 0);
-    if (n > nr_free) {
-        return NULL;
-    }
-    struct Page *page = NULL;
-    list_entry_t *le = &free_list;
-    size_t min_size = nr_free + 1;
-     /*LAB2 EXERCISE 2: YOUR CODE*/ 
-    // 下面的代码是first-fit的部分代码，请修改下面的代码改为best-fit
-    // 遍历空闲链表，查找满足需求的空闲页框
-    // 如果找到满足需求的页面，记录该页面以及当前找到的最小连续空闲页框数量
-    while ((le = list_next(le)) != &free_list) {
-        struct Page *p = le2page(le, page_link);
-        if (p->property >= n) {
-            if(p->property<min_size)
-            {
-                page = p;
-                min_size=p->property;
-            }
-        }
-    }
-
-    if (page != NULL) {
-        list_entry_t* prev = list_prev(&(page->page_link));
-        list_del(&(page->page_link));
-        if (page->property > n) {
-            struct Page *p = page + n;
-            p->property = page->property - n;
-            SetPageProperty(p);
-            list_add(prev, &(p->page_link));
-        }
-        nr_free -= n;
-        ClearPageProperty(page);
-    }
-    return page;
-}
-
-static void
-best_fit_free_pages(struct Page *base, size_t n) {
-    assert(n > 0);
-    struct Page *p = base;
-    for (; p != base + n; p ++) {
-        assert(!PageReserved(p) && !PageProperty(p));
-        p->flags = 0;
-        set_page_ref(p, 0);
-    }
-    /*LAB2 EXERCISE 2: YOUR CODE*/ 
-    // 编写代码
-    // 具体来说就是设置当前页块的属性为释放的页块数、并将当前页块标记为已分配状态、最后增加nr_free的值
-    base->property=n; //设置当前页块的属性为释放的页块数
-    SetPageProperty(base); //将当前页块标记为已分配状态
-    nr_free+=n; //增加nr_free的值
-
+    base->property = page_num;  //base page set totalnum of block
+    SetPageProperty(base);  //set base->flags->property bit to 1
+    nr_free += page_num; //update num free blocks
+    // insert this page to free_list
     if (list_empty(&free_list)) {
         list_add(&free_list, &(base->page_link));
     } else {
@@ -176,182 +129,185 @@ best_fit_free_pages(struct Page *base, size_t n) {
             }
         }
     }
-
-    list_entry_t* le = list_prev(&(base->page_link));
-    if (le != &free_list) {
-        p = le2page(le, page_link);
-        /*LAB2 EXERCISE 2: YOUR CODE*/ 
-         // 编写代码
-        // 1、判断前面的空闲页块是否与当前页块是连续的，如果是连续的，则将当前页块合并到前面的空闲页块中
-        // 2、首先更新前一个空闲页块的大小，加上当前页块的大小
-        // 3、清除当前页块的属性标记，表示不再是空闲页块
-        // 4、从链表中删除当前页块
-        // 5、将指针指向前一个空闲页块，以便继续检查合并后的连续空闲页块
-        if(p+p->property==base) 
+    pages_start = base;
+    //init buddy tree
+    buddy_tree.size=page_num;
+    size_t node_num = 2*page_num-1;
+    buddy_tree.nodenum=node_num;
+    buddy_tree.longest[0]=page_num;
+    buddy_tree.start_page_index[0]=0;
+    for(int i=1;i<node_num;i++)
+    {
+        buddy_tree.longest[i] = buddy_tree.longest[PARENT(i)] / 2;
+        if(i%2!=0)
         {
-            p->property+=base->property;
-            ClearPageProperty(base);
-            list_del(&(base->page_link));
-            base=p;
+            buddy_tree.start_page_index[i] = buddy_tree.start_page_index[PARENT(i)];
+        }
+        else
+        {
+            buddy_tree.start_page_index[i] = buddy_tree.start_page_index[PARENT(i)] + buddy_tree.longest[i];
         }
     }
+}
 
-    le = list_next(&(base->page_link));
-    if (le != &free_list) {
-        p = le2page(le, page_link);
-        if (base + base->property == p) {
-            base->property += p->property;
-            ClearPageProperty(p);
-            list_del(&(p->page_link));
+static struct Page *
+buddy_alloc_pages(size_t n)
+{
+    assert(n>0);
+    size_t alloc_size = CLOSEST_POWER_OF_2_ABOVE(n);
+    size_t index = find_alloc_index(alloc_size);
+    if(index==-1)
+    {
+        return NULL;
+    }
+    struct Page *p = pages_start + buddy_tree.start_page_index[index] ;
+    p->property = alloc_size;
+    ClearPageProperty(p);
+    nr_free -= alloc_size;
+    return p;
+}
+
+static void
+buddy_free_pages(struct Page *base, size_t n)
+{
+    assert(n>0);
+    size_t alloc_size = CLOSEST_POWER_OF_2_ABOVE(n);
+    struct Page *p = base;
+    for (; p != base + alloc_size; p ++) {
+        p->flags = 0;
+        set_page_ref(p, 0);
+    }
+    base->property = alloc_size;
+    SetPageProperty(base);
+    // find tree node index
+    size_t curr_size;
+    size_t index = 0;
+    size_t page_i = base - pages_start;
+    curr_size=buddy_tree.size;
+    while(1)
+    {
+        if(curr_size < alloc_size)
+        {
+            return;
+        }
+        if((curr_size == alloc_size) && (buddy_tree.start_page_index[index]==page_i))
+        {
+            break;
+        }
+        else
+        {
+            if(buddy_tree.start_page_index[RIGHT_CHILD(index)] > page_i)
+            {
+                index = LEFT_CHILD(index);
+                curr_size /= 2;
+            }
+            else
+            {
+                index = RIGHT_CHILD(index);
+                curr_size /= 2;
+            }
         }
     }
+    if(buddy_tree.longest[index]!=0) //this node wasn't alloced before
+    {
+        return;
+    }
+    //update parents
+    //cprintf("find index:%d\n",index);
+    buddy_tree.longest[index]=alloc_size;
+    size_t left_longest,right_longest;
+    while(index)
+    {
+        index=PARENT(index);
+        alloc_size*=2;
+        left_longest = buddy_tree.longest[LEFT_CHILD(index)];
+        right_longest = buddy_tree.longest[RIGHT_CHILD(index)];
+        if(left_longest+right_longest==alloc_size)
+        {
+            buddy_tree.longest[index]=alloc_size;
+        }
+        else
+        {
+            buddy_tree.longest[index]=MAX(left_longest,right_longest);
+        }
+    }
+    nr_free += alloc_size;
 }
 
 static size_t
-best_fit_nr_free_pages(void) {
+buddy_nr_free_pages(void) {
     return nr_free;
 }
 
-static void
-basic_check(void) {
-    struct Page *p0, *p1, *p2;
-    p0 = p1 = p2 = NULL;
-    assert((p0 = alloc_page()) != NULL);
-    assert((p1 = alloc_page()) != NULL);
-    assert((p2 = alloc_page()) != NULL);
+static void 
+buddy_check(void)
+{
+    assert(alloc_pages(20000)==NULL);
+    struct Page* p0;
+    // 分配p0并检查分配的块是否正确
+    p0 = alloc_pages(2000);
+    assert(p0!=NULL && p0->property==2048);
+    assert(buddy_tree.longest[7]==0 && buddy_tree.start_page_index[7] == p0 - pages_start);
+    // 检查父节点是否更新
+    assert(buddy_tree.longest[3]==2048 && buddy_tree.longest[1]==4096 && buddy_tree.longest[0]==8192);
+    // 依次分配p1,p2,p3,p4
+    struct Page* p1 = alloc_pages(8000);
+    assert(p1 != NULL && p1->property == 8192);
+    assert(buddy_tree.longest[2]==0 && buddy_tree.start_page_index[2] == p1-pages_start);
+    assert(buddy_tree.longest[0]==4096);
 
-    assert(p0 != p1 && p0 != p2 && p1 != p2);
-    assert(page_ref(p0) == 0 && page_ref(p1) == 0 && page_ref(p2) == 0);
+    struct Page* p2 = alloc_pages(4000);
+    assert(p2 != NULL && p2->property == 4096);
+    assert(buddy_tree.longest[4]==0 && p2 - pages_start == 4096);
+    assert(buddy_tree.longest[1]==2048 && buddy_tree.longest[0]==2048);
 
-    assert(page2pa(p0) < npage * PGSIZE);
-    assert(page2pa(p1) < npage * PGSIZE);
-    assert(page2pa(p2) < npage * PGSIZE);
+    struct Page* p3 = alloc_pages(4000);
+    assert(p3==NULL);
 
-    list_entry_t free_list_store = free_list;
-    list_init(&free_list);
-    assert(list_empty(&free_list));
+    struct Page* p4 = alloc_pages(2000);
+    assert(p4!=NULL && p4->property==2048);
+    assert(buddy_tree.longest[8]==0 && p4 - pages_start == 2048);
+    assert(buddy_tree.longest[3]==0 && buddy_tree.longest[1]==0 && buddy_tree.longest[0]==0);
+    //此时内存状态：
+    //| p0 | p4 |    p2     |           p1             |
+    //|2048|2048|   4096    |          8192            |
 
-    unsigned int nr_free_store = nr_free;
-    nr_free = 0;
+    //释放p0,p4，前两块合并
+    free_pages(p0,2000);
+    free_pages(p4,2000);
+    assert(buddy_tree.longest[7]==2048 && buddy_tree.longest[8]==2048);
+    assert(buddy_tree.longest[3]==4096); //检查是否合并
+    assert(buddy_tree.longest[1]==4096 && buddy_tree.longest[0]==4096);
+    //此时内存状态：
+    //|    空    |    p2     |           p1             |
+    //|   4096   |   4096    |          8192            |
+    
+    //检查释放后能否重新分配p5
+    struct Page* p5 = alloc_pages(3000);
+    assert(p5 != NULL && p5->property==4096);
+    assert(buddy_tree.longest[3]==0 && p5==pages_start);
+    assert(buddy_tree.longest[1]==0 && buddy_tree.longest[0]==0);
+    //此时内存状态：
+    //|    p5    |    p2     |           p1             |
+    //|   4096   |   4096    |          8192            |
 
-    assert(alloc_page() == NULL);
+    // 释放失败
+    free_pages(p2+10,4000);
+    assert(buddy_tree.longest[4]!=4096);
+    // 全部释放
+    free_pages(p2,4000);
+    free_pages(p1,8000);
+    free_pages(p5,3000);
+    assert(buddy_tree.longest[0]==buddy_tree.size);
 
-    free_page(p0);
-    free_page(p1);
-    free_page(p2);
-    assert(nr_free == 3);
-
-    assert((p0 = alloc_page()) != NULL);
-    assert((p1 = alloc_page()) != NULL);
-    assert((p2 = alloc_page()) != NULL);
-
-    assert(alloc_page() == NULL);
-
-    free_page(p0);
-    assert(!list_empty(&free_list));
-
-    struct Page *p;
-    assert((p = alloc_page()) == p0);
-    assert(alloc_page() == NULL);
-
-    assert(nr_free == 0);
-    free_list = free_list_store;
-    nr_free = nr_free_store;
-
-    free_page(p);
-    free_page(p1);
-    free_page(p2);
-}
-
-// LAB2: below code is used to check the best fit allocation algorithm 
-// NOTICE: You SHOULD NOT CHANGE basic_check, default_check functions!
-static void
-best_fit_check(void) {
-    int score = 0 ,sumscore = 6;
-    int count = 0, total = 0;
-    list_entry_t *le = &free_list;
-    while ((le = list_next(le)) != &free_list) {
-        struct Page *p = le2page(le, page_link);
-        assert(PageProperty(p));
-        count ++, total += p->property;
-    }
-    assert(total == nr_free_pages());
-
-    basic_check();
-
-    #ifdef ucore_test
-    score += 1;
-    cprintf("grading: %d / %d points\n",score, sumscore);
-    #endif
-    struct Page *p0 = alloc_pages(5), *p1, *p2;
-    assert(p0 != NULL);
-    assert(!PageProperty(p0));
-
-    #ifdef ucore_test
-    score += 1;
-    cprintf("grading: %d / %d points\n",score, sumscore);
-    #endif
-    list_entry_t free_list_store = free_list;
-    list_init(&free_list);
-    assert(list_empty(&free_list));
-    assert(alloc_page() == NULL);
-
-    #ifdef ucore_test
-    score += 1;
-    cprintf("grading: %d / %d points\n",score, sumscore);
-    #endif
-    unsigned int nr_free_store = nr_free;
-    nr_free = 0;
-
-    // * - - * -
-    free_pages(p0 + 1, 2);
-    free_pages(p0 + 4, 1);
-    assert(alloc_pages(4) == NULL);
-    assert(PageProperty(p0 + 1) && p0[1].property == 2);
-    // * - - * *
-    assert((p1 = alloc_pages(1)) != NULL);
-    assert(alloc_pages(2) != NULL);      // best fit feature
-    assert(p0 + 4 == p1);
-
-    #ifdef ucore_test
-    score += 1;
-    cprintf("grading: %d / %d points\n",score, sumscore);
-    #endif
-    p2 = p0 + 1;
-    free_pages(p0, 5);
-    assert((p0 = alloc_pages(5)) != NULL);
-    assert(alloc_page() == NULL);
-
-    #ifdef ucore_test
-    score += 1;
-    cprintf("grading: %d / %d points\n",score, sumscore);
-    #endif
-    assert(nr_free == 0);
-    nr_free = nr_free_store;
-
-    free_list = free_list_store;
-    free_pages(p0, 5);
-
-    le = &free_list;
-    while ((le = list_next(le)) != &free_list) {
-        struct Page *p = le2page(le, page_link);
-        count --, total -= p->property;
-    }
-    assert(count == 0);
-    assert(total == 0);
-    #ifdef ucore_test
-    score += 1;
-    cprintf("grading: %d / %d points\n",score, sumscore);
-    #endif
-}
-//这个结构体在
-const struct pmm_manager best_fit_pmm_manager = {
-    .name = "best_fit_pmm_manager",
-    .init = best_fit_init,
-    .init_memmap = best_fit_init_memmap,
-    .alloc_pages = best_fit_alloc_pages,
-    .free_pages = best_fit_free_pages,
-    .nr_free_pages = best_fit_nr_free_pages,
-    .check = best_fit_check,
 };
 
+const struct pmm_manager buddy_pmm_manager = {
+    .name = "buddy_pmm_manager",
+    .init = buddy_init,
+    .init_memmap = buddy_init_memmap,
+    .alloc_pages = buddy_alloc_pages,
+    .free_pages = buddy_free_pages,
+    .nr_free_pages = buddy_nr_free_pages,
+    .check = buddy_check,
+};
