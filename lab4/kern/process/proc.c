@@ -86,7 +86,7 @@ static struct proc_struct *
 alloc_proc(void) {
     struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
     if (proc != NULL) {
-    //LAB4:EXERCISE1 YOUR CODE
+    //LAB4:EXERCISE1 2110820
     /*
      * below fields in proc_struct need to be initialized
      *       enum proc_state state;                      // Process state
@@ -102,8 +102,18 @@ alloc_proc(void) {
      *       uint32_t flags;                             // Process flag
      *       char name[PROC_NAME_LEN + 1];               // Process name
      */
-
-
+        proc->state = PROC_UNINIT;  // 设置进程为“初始”态
+        proc->pid = -1; // 未初始化值
+        proc->runs = 0;
+        proc->kstack = 0;
+        proc->need_resched = 0;
+        proc->parent = NULL;
+        proc->mm = NULL;
+        memset(&proc->context,0,sizeof(struct context));
+        proc->tf = NULL;
+        proc->cr3 = boot_cr3;  //使用内核页目录表的基址
+        proc->flags = 0;
+        memset(&proc->name,0,sizeof(proc->name));
     }
     return proc;
 }
@@ -163,7 +173,7 @@ get_pid(void) {
 void
 proc_run(struct proc_struct *proc) {
     if (proc != current) {
-        // LAB4:EXERCISE3 YOUR CODE
+        // LAB4:EXERCISE3 2110820
         /*
         * Some Useful MACROs, Functions and DEFINEs, you can use them in below implementation.
         * MACROs or Functions:
@@ -172,7 +182,18 @@ proc_run(struct proc_struct *proc) {
         *   lcr3():                   Modify the value of CR3 register
         *   switch_to():              Context switching between two processes
         */
-       
+       //禁用中断
+       int x;
+       local_intr_save(x);
+       //切换当前进程为要运行的进程
+       struct context* curr_context = &(current->context);
+       current = proc;
+       //切换页表，以便使用新进程的地址空间。
+       lcr3(proc->cr3);
+       //实现上下文切换。
+       switch_to(curr_context,&(proc->context));
+       //允许中断
+       local_intr_restore(x);
     }
 }
 
@@ -193,15 +214,18 @@ hash_proc(struct proc_struct *proc) {
 // find_proc - find proc frome proc hash_list according to pid
 struct proc_struct *
 find_proc(int pid) {
+    cprintf("call find_proc\n");
     if (0 < pid && pid < MAX_PID) {
         list_entry_t *list = hash_list + pid_hashfn(pid), *le = list;
         while ((le = list_next(le)) != list) {
             struct proc_struct *proc = le2proc(le, hash_link);
             if (proc->pid == pid) {
+                cprintf("find_proc:%d\n",pid);
                 return proc;
             }
         }
     }
+    cprintf("find_proc:NULL\n");
     return NULL;
 }
 
@@ -292,13 +316,39 @@ do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf) {
      */
 
     //    1. call alloc_proc to allocate a proc_struct
+    proc = alloc_proc();
+    if(proc==NULL)
+    {
+        goto bad_fork_cleanup_proc;
+    }
     //    2. call setup_kstack to allocate a kernel stack for child process
+    if(setup_kstack(proc) == -E_NO_MEM) //分配失败
+    {
+        goto bad_fork_cleanup_kstack;
+    }
     //    3. call copy_mm to dup OR share mm according clone_flag
-    //    4. call copy_thread to setup tf & context in proc_struct
-    //    5. insert proc_struct into hash_list && proc_list
-    //    6. call wakeup_proc to make the new child process RUNNABLE
-    //    7. set ret vaule using child proc's pid
+    copy_mm(clone_flags,proc);
+    // if(clone_flags==CLONE_VM){
+    //     //if clone_flags & CLONE_VM, then "share"
+    //     copy_mm(clone_flags,proc);
+    // }else{
+    //     //else "duplicate"
+    //     copy_mm(clone_flags,proc);
+    // }
 
+    //    4. call copy_thread to setup tf & context in proc_struct
+    copy_thread(proc,stack,tf);
+    //    5. insert proc_struct into hash_list && proc_list
+    proc->pid = get_pid();
+    cprintf("get_pid:%d",proc->pid);
+    hash_proc(proc);
+    list_entry_t *head=&proc_list;
+    list_add_before(head, &(proc->list_link));
+    //    6. call wakeup_proc to make the new child process RUNNABLE
+    wakeup_proc(proc);
+    //    7. set ret vaule using child proc's pid
+    ret = proc->pid;
+    goto fork_out;
     
 
 fork_out:
@@ -372,6 +422,7 @@ proc_init(void) {
     current = idleproc;
 
     int pid = kernel_thread(init_main, "Hello world!!", 0);
+    cprintf("pid:%d\n",pid);
     if (pid <= 0) {
         panic("create init_main failed.\n");
     }
