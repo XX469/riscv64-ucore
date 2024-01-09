@@ -472,7 +472,7 @@ int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
             assert(page != NULL);
             assert(npage != NULL);
             int ret = 0;
-            /* LAB5:EXERCISE2 YOUR CODE
+            /* LAB5:EXERCISE2 2110820
              * replicate content of page to npage, build the map of phy addr of
              * nage with the linear addr start
              *
@@ -490,6 +490,8 @@ int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
              * (3) memory copy from src_kvaddr to dst_kvaddr, size is PGSIZE
              * (4) build the map of phy addr of  nage with the linear addr start
              */
+            memcpy(page2kva(npage),page2kva(page),PGSIZE);
+            ret = page_insert(to, npage, start, perm);
             assert(ret == 0);
         }
         start += PGSIZE;

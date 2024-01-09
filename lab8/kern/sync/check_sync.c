@@ -179,12 +179,23 @@ void phi_test_condvar (int i) {
 
 
 void phi_take_forks_condvar(int i) {
-     down(&(mtp->mutex));
+     //通过P操作进入临界区
+     down(&(mtp->mutex));  
+      //记录下哲学家i是否饥饿，即处于等待状态拿叉子
+      state_condvar[i]=HUNGRY; 
+      phi_test_condvar(i);
+      while (state_condvar[i] != EATING) 
+      {
+          cprintf("phi_take_forks_condvar: %d didn't get fork and will wait\n",i);
+          cond_wait(&mtp->cv[i]);//如果得不到叉子就睡眠
+      }
+      //如果存在睡眠的进程则那么将之唤醒
 //--------into routine in monitor--------------
      // LAB7 EXERCISE2: YOUR CODE
      // I am hungry
      // try to get fork
 //--------leave routine in monitor--------------
+
       if(mtp->next_count>0)
          up(&(mtp->next));
       else
@@ -193,6 +204,13 @@ void phi_take_forks_condvar(int i) {
 
 void phi_put_forks_condvar(int i) {
      down(&(mtp->mutex));
+     //记录进餐结束的状态
+      state_condvar[i]=THINKING;
+    //看一下左边哲学家现在是否能进餐
+      phi_test_condvar(LEFT);
+    //看一下右边哲学家现在是否能进餐
+      phi_test_condvar(RIGHT);
+      //如果有哲学家睡眠就予以唤醒
 
 //--------into routine in monitor--------------
      // LAB7 EXERCISE2: YOUR CODE
